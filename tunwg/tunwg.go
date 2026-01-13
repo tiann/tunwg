@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -25,6 +26,16 @@ var forwardFlag = flag.String("forward", "", "hosts to forward")
 var limitFlag = flag.String("limit", "", "username password in htpasswd format. bcrypt and plain text are supported")
 var limitOncePerIPFlag = flag.Duration("limit_once_on_ip", 0, "Only ask for basic auth once per ip per duration")
 var portFlag = flag.Uint("p", 0, "port to forward")
+var jsonFlag = flag.Bool("json", false, "emit JSON events to stdout")
+
+type readyEvent struct {
+	Event     string `json:"event"`
+	Forward   string `json:"forward"`
+	Encoded   string `json:"encoded"`
+	URL       string `json:"url"`
+	ApiDomain string `json:"api_domain"`
+	Relay     bool   `json:"relay"`
+}
 
 func main() {
 	if os.Getenv("TUNWG_RUN_SERVER") == "true" {
@@ -64,6 +75,21 @@ func main() {
 		l, err := tunwg.NewListener(p)
 		if err != nil {
 			log.Fatalf("failed to connect: %v", err)
+		}
+		encoded := l.Addr().String()
+		apiDomain := internal.ApiDomain()
+		if *jsonFlag {
+			event := readyEvent{
+				Event:     "ready",
+				Forward:   p,
+				Encoded:   encoded,
+				URL:       fmt.Sprintf("https://%s.%s", encoded, apiDomain),
+				ApiDomain: apiDomain,
+				Relay:     internal.UseRelay(),
+			}
+			if err := json.NewEncoder(os.Stdout).Encode(event); err != nil {
+				log.Printf("tunwg: failed to encode json: %v", err)
+			}
 		}
 		turl := internal.Must(url.Parse(p))
 		rp := &httputil.ReverseProxy{
