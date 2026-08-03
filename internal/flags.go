@@ -40,6 +40,22 @@ func AuthKey() string {
 	return os.Getenv("TUNWG_AUTH")
 }
 
+// AuthSecret is the server-side HMAC secret for issued auth keys.
+// When set, only issued keys are accepted; the shared AuthKey is ignored.
+func AuthSecret() string {
+	return os.Getenv("TUNWG_AUTH_SECRET")
+}
+
+// QuotaBytes is the daily traffic quota in bytes (rx+tx). The server applies
+// it per auth credential, or per WireGuard peer when auth is disabled.
+// 0 or unset disables quota enforcement.
+func QuotaBytes() int64 {
+	if v := os.Getenv("TUNWG_QUOTA_BYTES"); v != "" {
+		return Must(strconv.ParseInt(v, 10, 64))
+	}
+	return 0
+}
+
 func ServerIp() string {
 	ip := os.Getenv("TUNWG_IP")
 	return ip

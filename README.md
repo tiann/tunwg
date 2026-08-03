@@ -123,11 +123,19 @@ tunwgs:
 
 Clients will connect to your hosted instance if you set the same `TUNWG_API` environment variable there.
 
-You can also set the `TUNWG_AUTH` environment variable to limit which clients can use your server. In that case, clients would need to set the same `TUNWG_AUTH`.
+You can also set the `TUNWG_AUTH` environment variable to limit which clients can use your server. In that case, clients would need to set the same `TUNWG_AUTH`; changing it invalidates active and persisted peers authorized by the previous value.
+
+For individually revocable credentials, set `TUNWG_AUTH_SECRET` on the server and request a key with `POST https://<TUNWG_API>/issue`. Clients pass the returned key through their existing `TUNWG_AUTH` environment variable. Put one issued key ID per line in `$TUNWG_PATH/server/revoked_keys` to revoke it. Rotating `TUNWG_AUTH_SECRET` invalidates previously issued credentials and requires peers to register again. Each issued key may have at most three active WireGuard peers. The issue endpoint allows 20 keys per source IP in each 24-hour window and returns HTTP 429 with `Retry-After` when exhausted.
+
+`TUNWG_QUOTA_BYTES` enables a daily traffic allowance, counting received and transmitted bytes together. Usage is aggregated across every peer registered with the same issued or shared auth key; without authentication, usage remains per WireGuard peer. When a key exceeds quota, all of its peers are removed and that key cannot register another peer until the next local calendar day.
 
 The server listens on port 443 (for HTTPS traffic) and on port 80 (to redirect to HTTPS and for http-01 SSL challenges). It also listens on UDP port `TUNWG_PORT` for wireguard UDP traffic. The public instance listens on UDP 443, since it's less likely to be blocked by firewalls.
 
-The server is fully stateless and doesn't require any storage. It caches the wireguard private key and recent peers on disk to enable instant reconnection of tunnels after server restart. The tunwg client will add itself as peer again if the wireguard handshake with server is missed.
+The server stores its WireGuard key and access-control state under `TUNWG_PATH` (the default user config directory, or `/data` in the container). `$TUNWG_PATH/server/access_state.json` is the single durable source for peer credentials, quota usage, blocks, recent endpoints, and `/issue` rate limits. Persist this directory across restarts when using authentication or quotas. The tunwg client will register itself again if a peer cannot be safely restored.
+
+Access control intentionally fails closed: unreadable state, failed durable writes, or WireGuard snapshot errors stop the server instead of resetting authorization or quota data. Revocation-file I/O errors deny new issued-key registrations and remove active issued-key peers. Monitor fatal access-state/controller logs, container restart count, free disk space, and writable state volume to catch restart loops.
+
+If `access_state.json` is lost, restore it together with `access_state.initialized` from the same backup. To intentionally discard all peer authorization, quota, block, and issue-limit history, stop the server, remove both files, and start it again. Removing only the initialization marker while retaining an unknown state file is not a supported recovery procedure.
 
 If you're running it behind a reverse proxy like caddy/nginx, you should make sure that the reverse proxy passes through TLS instead of decrypting HTTPS traffic.
 

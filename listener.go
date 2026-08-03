@@ -72,7 +72,11 @@ func addServerPeer() error {
 	if err != nil {
 		return err
 	}
+	defer httpResp.Body.Close()
 	if httpResp.StatusCode != http.StatusOK {
+		slog.Warn("peer registration rejected",
+			"event", "peer_registration_rejected",
+			"status", httpResp.StatusCode)
 		return fmt.Errorf("error adding peer: %v", httpResp.Status)
 	}
 	respBytes, err := io.ReadAll(httpResp.Body)

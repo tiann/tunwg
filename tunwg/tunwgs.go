@@ -14,11 +14,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/netip"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/inetaf/tcpproxy"
@@ -36,6 +33,15 @@ func tunwgServer() {
 	}
 	if err := internal.Initialize(); err != nil {
 		fatal("failed to initialize", "err", err)
+	}
+	if err := globalAccess.load(); err != nil {
+		fatal("access state unavailable", "err", err)
+	}
+	if err := globalAccess.restorePeers(); err != nil {
+		fatal("failed to restore peers safely", "err", err)
+	}
+	if err := globalAccess.reconcile(); err != nil {
+		fatal("failed to reconcile access state", "err", err)
 	}
 	l443 := &tcpproxy.TargetListener{Address: "https"}
 	go func() {
@@ -63,10 +69,8 @@ func tunwgServer() {
 			fatal("failed to serve redirect handler", "err", err)
 		}
 	}()
-	go globalPersist.loadFromDisk()
-	go globalPersist.backgroundWriter(time.Minute)
 	go internal.BackgroundLogger(10 * time.Second)
-	go internal.PurgeStalePeers(15*time.Minute, 30*time.Minute)
+	go globalAccess.run(30 * time.Second)
 	fatal("failed to run", "err", runSniProxy(l80, l443))
 }
 
@@ -104,14 +108,54 @@ func sslRedirect() *http.ServeMux {
 	return mux
 }
 
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 func apiMux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/add", func(w http.ResponseWriter, r *http.Request) {
-		if authKey, reqKey := internal.AuthKey(), r.Header.Get("X-Authorization"); authKey != "" && authKey != reqKey {
-			w.WriteHeader(http.StatusForbidden)
+	mux.HandleFunc("/issue", func(w http.ResponseWriter, r *http.Request) {
+		if internal.AuthSecret() == "" {
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		reqBytes, err := io.ReadAll(r.Body)
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		ip := clientIP(r)
+		key, err := globalAccess.issueAuthKey(ip, defaultIssueLimitPerIPPerDay, 24*time.Hour)
+		if err != nil {
+			switch {
+			case errors.Is(err, errIssueRateLimited):
+				var rateLimitErr *issueRateLimitError
+				if errors.As(err, &rateLimitErr) {
+					seconds := (rateLimitErr.retryAfter + time.Second - 1) / time.Second
+					w.Header().Set("Retry-After", strconv.FormatInt(int64(seconds), 10))
+				}
+				w.WriteHeader(http.StatusTooManyRequests)
+			case errors.Is(err, errAccessStateUnavailable):
+				w.WriteHeader(http.StatusServiceUnavailable)
+			default:
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			return
+		}
+		slog.Info("issued auth key", "ip", ip, "key_id", strings.SplitN(key, ".", 2)[0])
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		json.NewEncoder(w).Encode(map[string]string{"key": key})
+	})
+	mux.HandleFunc("/add", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		reqBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<10))
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
@@ -126,11 +170,22 @@ func apiMux() *http.ServeMux {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		if err := allowUserKey(clientKey, ""); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
+		credential, err := globalAccess.registerPeer(clientKey, r.Header.Get("X-Authorization"))
+		if err != nil {
+			slog.Warn("rejected peer add", "ip", clientIP(r), "key_id", credential.keyID, "peer", clientKey.String(), "err", err)
+			switch {
+			case errors.Is(err, errAccessUnauthorized):
+				w.WriteHeader(http.StatusForbidden)
+			case errors.Is(err, errRevocationsUnavailable), errors.Is(err, errAccessStateUnavailable):
+				w.WriteHeader(http.StatusServiceUnavailable)
+			case errors.Is(err, errPeerBlocked), errors.Is(err, errPeerLimitReached):
+				w.WriteHeader(http.StatusTooManyRequests)
+			default:
+				w.WriteHeader(http.StatusInternalServerError)
+			}
 			return
 		}
-		globalPersist.markDirty()
+		slog.Info("peer added", "ip", clientIP(r), "key_id", credential.keyID, "peer", clientKey.String())
 		key := internal.GetPublicKey()
 		resp := internal.AddPeerResp{
 			Key:      key[:],
@@ -141,8 +196,8 @@ func apiMux() *http.ServeMux {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
 		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
 		w.Write(respBytes)
 	})
 	mux.HandleFunc("/relay", func(w http.ResponseWriter, r *http.Request) {
@@ -221,80 +276,4 @@ func getIPForDomain(sniName string) (*netip.AddrPort, error) {
 		return nil, fmt.Errorf("error in dispatching: %v", sniName)
 	}
 	return addr, nil
-}
-
-// Persist last seen endpoint to disk
-// This enables almost instant reconnect after server restart.
-var globalPersist = &persistPeers{}
-
-type persistPeers struct {
-	dirty atomic.Bool
-	peers map[string]struct {
-		Endpoint string
-	}
-}
-
-func (p *persistPeers) markDirty() {
-	p.dirty.Store(true)
-}
-
-func (p *persistPeers) backgroundWriter(d time.Duration) {
-	var lastWritten time.Time
-	for range time.Tick(d) {
-		if !p.dirty.Swap(false) && time.Since(lastWritten) < 15*time.Minute {
-			continue
-		}
-		slog.Info("writing peers to disk")
-		if err := p.writeToDisk(); err != nil {
-			slog.Error("error writing peers", "err", err)
-		}
-		lastWritten = time.Now()
-	}
-}
-
-func (p *persistPeers) writeToDisk() error {
-	dev, err := internal.GetWgDeviceInfo()
-	if err != nil {
-		return err
-	}
-	p.peers = make(map[string]struct{ Endpoint string })
-	for _, peer := range dev.Peers {
-		if time.Since(peer.LastHandshakeTime) < 15*time.Minute {
-			// Only write peers who were connected in the last 15 minutes.
-			p.peers[string(peer.PublicKey.String())] = struct{ Endpoint string }{
-				Endpoint: peer.Endpoint.String(),
-			}
-		}
-	}
-	slog.Debug("peers to write", "peers", p.peers)
-	data, err := json.Marshal(p.peers)
-	if err != nil {
-		return err
-	}
-	_ = os.Mkdir(filepath.Join(internal.Keystorage(), "server"), 0o700)
-	return os.WriteFile(filepath.Join(internal.Keystorage(), "server/peers.json"), data, 0o600)
-}
-
-func (p *persistPeers) loadFromDisk() {
-	p.peers = make(map[string]struct{ Endpoint string })
-	data, err := os.ReadFile(filepath.Join(internal.Keystorage(), "server/peers.json"))
-	if err != nil {
-		slog.Debug("error reading peers file", "err", err)
-		return
-	}
-	if err := json.Unmarshal(data, &p.peers); err != nil {
-		slog.Error("error unmarshaling peers", "err", err)
-		return
-	}
-	for k, v := range p.peers {
-		key, err := wgtypes.ParseKey(k)
-		if err != nil {
-			slog.Error("error parsing peer key", "err", err)
-			continue
-		}
-		// TODO: these writes could be combined to one IPC operation
-		if err := allowUserKey(key, v.Endpoint); err != nil {
-			slog.Error("error allowing user", "err", err)
-		}
-	}
 }
