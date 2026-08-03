@@ -7,7 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -26,7 +26,8 @@ var forwardFlag = flag.String("forward", "", "hosts to forward")
 var limitFlag = flag.String("limit", "", "username password in htpasswd format. bcrypt and plain text are supported")
 var limitOncePerIPFlag = flag.Duration("limit_once_on_ip", 0, "Only ask for basic auth once per ip per duration")
 var portFlag = flag.Uint("p", 0, "port to forward")
-var jsonFlag = flag.Bool("json", false, "emit JSON events to stdout")
+var jsonFlag = flag.Bool("json", false, "emit JSON ready events to stdout and log in JSON format")
+var logLevelFlag = flag.Int("log_level", int(slog.LevelDebug), "log level: debug=-4, info=0, warn=4, error=8")
 
 type readyEvent struct {
 	Event     string `json:"event"`
@@ -35,6 +36,20 @@ type readyEvent struct {
 	URL       string `json:"url"`
 	ApiDomain string `json:"api_domain"`
 	Relay     bool   `json:"relay"`
+}
+
+func configureLogging() {
+	level := slog.Level(*logLevelFlag)
+	if *jsonFlag {
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	} else {
+		slog.SetLogLoggerLevel(level)
+	}
+}
+
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
 }
 
 func main() {
@@ -54,8 +69,9 @@ func main() {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
 	flag.Parse()
+	configureLogging()
 	if (*forwardFlag == "") == (*portFlag == 0) {
-		log.Fatalf("Specify one of port to forward (-p) or urls to forward (--forward)")
+		fatal("specify one of port to forward (-p) or urls to forward (--forward)")
 	}
 	if internal.TestOnlyRunLocalhost() {
 		enableLocahostServerTesting()
@@ -74,7 +90,7 @@ func main() {
 	for _, p := range ps {
 		l, err := tunwg.NewListener(p)
 		if err != nil {
-			log.Fatalf("failed to connect: %v", err)
+			fatal("failed to connect", "err", err)
 		}
 		encoded := l.Addr().String()
 		apiDomain := internal.ApiDomain()
@@ -88,20 +104,20 @@ func main() {
 				Relay:     internal.UseRelay(),
 			}
 			if err := json.NewEncoder(os.Stdout).Encode(event); err != nil {
-				log.Printf("tunwg: failed to encode json: %v", err)
+				slog.Warn("failed to encode ready event", "err", err)
 			}
 		}
 		turl := internal.Must(url.Parse(p))
 		rp := &httputil.ReverseProxy{
 			Rewrite: func(pr *httputil.ProxyRequest) {
-				log.Printf("[%v] %v %v%v %v %v", time.Now(), pr.In.Method, pr.In.Host, pr.In.URL.Path, pr.In.RemoteAddr, pr.In.UserAgent())
+				slog.Debug("access", "method", pr.In.Method, "host", pr.In.Host, "path", pr.In.URL.Path, "remote_addr", pr.In.RemoteAddr, "user_agent", pr.In.UserAgent())
 				pr.Out.URL.Scheme = turl.Scheme
 				pr.Out.URL.Host = turl.Host
 				// TODO: support base path
 				pr.SetXForwarded()
 			},
 			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-				log.Printf("http: proxy error: %v", err)
+				slog.Error("proxy error", "err", err, "method", r.Method, "host", r.Host, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
 				w.WriteHeader(http.StatusBadGateway)
 				w.Write([]byte("Invalid response from forwarded server"))
 			},
@@ -118,7 +134,7 @@ func main() {
 		g.Add(1)
 		go func() {
 			defer g.Done()
-			log.Fatalf("proxy error: %v", srv.Serve(l))
+			fatal("proxy serve failed", "err", srv.Serve(l))
 		}()
 	}
 	g.Wait()
@@ -161,7 +177,7 @@ func authValidator() func(username, password string) bool {
 	}
 	ls := strings.SplitN(limit, ":", 2)
 	if len(ls) != 2 {
-		log.Fatalf("invalid value for --limit. Use htpasswd format")
+		fatal("invalid value for --limit. Use htpasswd format")
 	}
 	euser, epass := ls[0], ls[1]
 	if strings.HasPrefix(epass, "$2") {
@@ -169,7 +185,7 @@ func authValidator() func(username, password string) bool {
 			return username == euser && bcrypt.CompareHashAndPassword([]byte(epass), []byte(password)) == nil
 		}
 	}
-	log.Println("tunwg: using plain text password")
+	slog.Warn("using plain text password")
 	return func(username, password string) bool {
 		return username == euser && password == epass
 	}
