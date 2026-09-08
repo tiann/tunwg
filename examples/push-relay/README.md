@@ -28,22 +28,25 @@ directory. The stored keys and access state keep existing URLs and quotas.
 For a fresh installation, copy the example directory outside the source tree,
 copy `.env.example` to `.env`, and create the empty data directory named there.
 
-Build the new tunwg image from the **tunwg repository root**:
+All three services use prebuilt images. The deployment server needs only
+`compose.yaml`, `Caddyfile`, `.env`, the existing tunwg data, and the APNs key;
+no HAPI source checkout or image build is required.
 
-```sh
-docker build -t tunwg:sni-local .
-```
+- `TUNWG_IMAGE`: `ghcr.io/tiann/tunwg:e047fa3` includes static SNI support.
+  Keep this tag or select a newer tested commit tag; older images do not
+  understand the SNI settings.
+- `PUSH_RELAY_IMAGE`: `ghcr.io/tiann/hapi-push-relay:latest`. HAPI's
+  **Push Relay Image** workflow must publish it before the first deployment.
+  For a pinned version, use a published `sha-<full-commit-sha>` tag or digest
+  from that workflow. Both Linux AMD64 and ARM64 are supported.
 
-Set `TUNWG_IMAGE=tunwg:sni-local`, or use a published fixed commit SHA tag
-containing static SNI support. An old image will not understand these settings.
-The root `.dockerignore` excludes deployment files and local access state from
-the build context.
+After the first Push image publication, its GitHub Package must be made
+**Public** for anonymous pulls. See the
+[HAPI publishing instructions](https://github.com/tiann/hapi/tree/main/relay#publishing-images).
 
 Fill in the remaining `.env` values:
 
 - `PUSH_DOMAIN`: the public hostname, default `push.hapi.run`.
-- `HAPI_PUSH_RELAY_CONTEXT`: the absolute path to the HAPI repository's `relay/`
-  directory. The Compose file builds its existing Dockerfile.
 - `APNS_KEY_P8_PATH`, `APNS_KEY_ID`, `APNS_TEAM_ID`: credentials for the installed
   iOS app's Apple developer team. The `.p8` is mounted read-only and must be
   readable by the image's `bun` user (normally UID 1000).
@@ -63,7 +66,7 @@ From the deployment directory:
 
 ```sh
 docker compose config --quiet
-docker compose build push-relay
+docker compose pull
 docker compose run --rm --no-deps caddy caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile
 docker compose up -d
 docker compose ps
@@ -90,6 +93,19 @@ delivery outcomes, and container restart/health status.
 The Hub defaults to `https://push.hapi.run`. For another domain, configure the
 machine running the Hub with `HAPI_IOS_PUSH=relay` and
 `HAPI_PUSH_RELAY_URL=https://your-push-domain`.
+
+## Update
+
+Set the desired image tags in `.env`, then run in the same deployment directory:
+
+```sh
+docker compose pull
+docker compose up -d
+curl -fsS https://push.hapi.run/health
+```
+
+Keep the previous image tags for rollback. Keys, tunwg state, and Caddy
+certificates stay in their existing mounts.
 
 ## Real client IPs
 

@@ -40,9 +40,7 @@ services:
         condition: service_healthy
 
   push-relay:
-    image: hapi-push-relay:local
-    build:
-      context: "${HAPI_PUSH_RELAY_CONTEXT:?Set the absolute path to the HAPI relay source directory}"
+    image: "${PUSH_RELAY_IMAGE:-ghcr.io/tiann/hapi-push-relay:latest}"
     restart: unless-stopped
     environment:
       RELAY_PORT: "8790"
