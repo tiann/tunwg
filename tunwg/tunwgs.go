@@ -31,6 +31,10 @@ func tunwgServer() {
 	} else if internal.ServerIp() == "" {
 		fatal("TUNWG_IP needs to be set")
 	}
+	sniConfig, err := loadSNIConfig()
+	if err != nil {
+		fatal("invalid static SNI configuration", "err", err)
+	}
 	if err := internal.Initialize(); err != nil {
 		fatal("failed to initialize", "err", err)
 	}
@@ -71,7 +75,11 @@ func tunwgServer() {
 	}()
 	go internal.BackgroundLogger(10 * time.Second)
 	go globalAccess.run(30 * time.Second)
-	fatal("failed to run", "err", runSniProxy(l80, l443))
+	for _, route := range sniConfig.routes {
+		slog.Info("static SNI route configured", "host", route.host, "target", route.target, "proxy_protocol", sniConfig.proxyProtocol)
+	}
+	proxy := newSNIProxy(l80, l443, sniConfig, tunnelSNITarget)
+	fatal("failed to run", "err", proxy.Run())
 }
 
 func allowUserKey(key wgtypes.Key, endpoint string) error {
@@ -231,25 +239,19 @@ func apiMux() *http.ServeMux {
 	return mux
 }
 
-func runSniProxy(l80, l443 *tcpproxy.TargetListener) error {
-	var proxy tcpproxy.Proxy
-	proxy.AddRoute(":80", l80)
-	proxy.AddSNIRoute(":443", internal.ApiDomain(), l443)
-	proxy.AddSNIRouteFunc(":443", func(ctx context.Context, sniName string) (tcpproxy.Target, bool) {
-		slog.Debug("received request", "server_name", sniName)
-		addr, err := getIPForDomain(sniName)
-		if err != nil {
-			slog.Debug("dispatch error", "server_name", sniName, "err", err)
-			return nil, false
-		}
-		return &tcpproxy.DialProxy{
-			Addr:                 addr.String(),
-			DialContext:          internal.DialWg,
-			DialTimeout:          5 * time.Second,
-			ProxyProtocolVersion: 1,
-		}, true
-	})
-	return proxy.Run()
+func tunnelSNITarget(_ context.Context, sniName string) (tcpproxy.Target, bool) {
+	slog.Debug("received request", "server_name", sniName)
+	addr, err := getIPForDomain(sniName)
+	if err != nil {
+		slog.Debug("dispatch error", "server_name", sniName, "err", err)
+		return nil, false
+	}
+	return &tcpproxy.DialProxy{
+		Addr:                 addr.String(),
+		DialContext:          internal.DialWg,
+		DialTimeout:          5 * time.Second,
+		ProxyProtocolVersion: 1,
+	}, true
 }
 
 func getIPForDomain(sniName string) (*netip.AddrPort, error) {

@@ -1,0 +1,63 @@
+services:
+  tunwgs:
+    image: "${TUNWG_IMAGE:?Set the image tag containing static SNI support}"
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      TUNWG_RUN_SERVER: "true"
+      TUNWG_IP: "${TUNWG_IP:?Set the existing relay public IP}"
+      TUNWG_PORT: "443"
+      TUNWG_API: "${TUNWG_API:-relay.hapi.run}"
+      TUNWG_AUTH_SECRET: "${TUNWG_AUTH_SECRET:?Reuse the existing signing secret}"
+      TUNWG_QUOTA_BYTES: "${TUNWG_QUOTA_BYTES:-5368709120}"
+      TUNWG_SNI_ROUTES: "${PUSH_DOMAIN:-push.hapi.run}=127.0.0.1:8443"
+      TUNWG_SNI_PROXY_PROTOCOL: "true"
+    volumes:
+      - type: bind
+        source: "${TUNWG_DATA_DIR:?Set the absolute path to the existing tunwg data directory}"
+        target: /data
+        bind:
+          create_host_path: false
+
+  caddy:
+    image: caddy:2.11.4
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      PUSH_DOMAIN: "${PUSH_DOMAIN:-push.hapi.run}"
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+      - ./caddy-data:/data
+    depends_on:
+      tunwgs:
+        condition: service_started
+      push-relay:
+        condition: service_healthy
+
+  push-relay:
+    image: hapi-push-relay:local
+    build:
+      context: "${HAPI_PUSH_RELAY_CONTEXT:?Set the absolute path to the HAPI relay source directory}"
+    restart: unless-stopped
+    environment:
+      RELAY_PORT: "8790"
+      RELAY_APNS_KEY_P8_PATH: /keys/apns.p8
+      RELAY_APNS_KEY_ID: "${APNS_KEY_ID:?Set the Apple APNs key ID}"
+      RELAY_APNS_TEAM_ID: "${APNS_TEAM_ID:?Set the Apple developer team ID}"
+      RELAY_APNS_BUNDLE_ID: "${APNS_BUNDLE_ID:-run.hapi.app}"
+      RELAY_APNS_ENV: "${APNS_ENV:-production}"
+      RELAY_TRUST_PROXY: "true"
+    ports:
+      - "127.0.0.1:8790:8790"
+    volumes:
+      - type: bind
+        source: "${APNS_KEY_P8_PATH:?Set the absolute path to the APNs p8 key}"
+        target: /keys/apns.p8
+        read_only: true
+        bind:
+          create_host_path: false

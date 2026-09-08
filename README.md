@@ -139,6 +139,53 @@ If `access_state.json` is lost, restore it together with `access_state.initializ
 
 If you're running it behind a reverse proxy like caddy/nginx, you should make sure that the reverse proxy passes through TLS instead of decrypting HTTPS traffic.
 
+### Static SNI routes
+
+The server can share TCP 443 with other TLS services on the same machine or
+network. Configure one exact `domain=host:port` mapping per line:
+
+```yaml
+environment:
+  TUNWG_SNI_ROUTES: "push.hapi.run=127.0.0.1:8443"
+  TUNWG_SNI_PROXY_PROTOCOL: "true"
+```
+
+For multiple backends, use a YAML literal block to preserve newlines:
+
+```yaml
+TUNWG_SNI_ROUTES: |
+  push.hapi.run=127.0.0.1:8443
+  status.hapi.run=[::1]:9443
+```
+
+Blank lines and surrounding whitespace are ignored. Domains are matched
+case-insensitively, with a trailing dot ignored. Backends accept DNS names,
+IPv4, or bracketed IPv6 addresses with a numeric port. Invalid mappings,
+duplicate domains, wildcards, and the API domain or any of its subdomains
+are rejected at startup. Configuration is read once; restart to apply changes.
+An unset or empty `TUNWG_SNI_ROUTES` keeps the original tunnel routing.
+
+`TUNWG_SNI_PROXY_PROTOCOL` defaults to `false`. Setting it to `true` sends a
+PROXY protocol v1 header to **every static backend**, carrying the original
+client address. Each backend must support that header before TLS; there is
+no automatic downgrade. The API and WireGuard routes keep their existing
+source-address handling.
+
+Routing order is the API, then static domains, then the existing encoded-domain
+and CNAME tunnel lookup. Static routes use ordinary TCP with a 5-second connect
+timeout. A failed backend closes that connection without falling through to
+the tunnel lookup. These connections do not create WireGuard peers, require
+tunnel credentials, or count toward `TUNWG_QUOTA_BYTES`.
+
+TLS, including ALPN, passes through to the backend. The backend owns its
+certificate; use TLS-ALPN-01 through public TCP 443, DNS-01, or an existing
+certificate. TCP 80 keeps its tunnel challenge/redirect handling: static
+backends do not receive HTTP-01 challenges. Point each static domain directly
+at the server's public IP (DNS only when using Cloudflare).
+
+See [Push relay with Caddy](examples/push-relay/README.md) for a complete
+same-host Compose example, including automatic certificates and real client IPs.
+
 ## Internal Details
 
 One of the primary goals for tunwg was to securely allow new clients to join without requiring any configuration or database on server, and to allow end to end SSL.
@@ -154,6 +201,16 @@ Run server: `TUNWG_TEST_LOCALHOST=true TUNWG_RUN_SERVER=true TUNWG_KEY=tunwgs TU
 Run client: `TUNWG_TEST_LOCALHOST=true go run ./tunwg --forward=http://localhost:8000`
 
 Test: `curl -k -Li --connect-to ::127.0.0.1: https://abcd.l.tunwg.com`
+
+Run the Go checks with `go test -race ./...` and `go vet ./...`. The optional
+Caddy integration test needs Linux and a local Docker daemon:
+
+```bash
+TUNWG_TEST_CADDY=1 go test -race ./tunwg -run TestSNIProxyCaddy -count=1
+```
+
+It uses the official `caddy:2.11.4` image, temporary ports and a local test
+certificate; it does not contact a certificate authority or APNs.
 
 ## Possible Future Improvements
 

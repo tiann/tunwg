@@ -1,0 +1,26 @@
+{
+	admin off
+	https_port 8443
+	auto_https disable_redirects
+	servers {
+		protocols h1 h2
+		listener_wrappers {
+			proxy_protocol {
+				timeout 5s
+				fallback_policy require
+			}
+			tls
+		}
+	}
+}
+
+{$PUSH_DOMAIN:push.hapi.run} {
+	bind 127.0.0.1
+	tls {
+		issuer acme {
+			dir https://acme-v02.api.letsencrypt.org/directory
+			disable_http_challenge
+		}
+	}
+	reverse_proxy 127.0.0.1:8790
+}
